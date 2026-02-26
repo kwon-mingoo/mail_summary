@@ -1,0 +1,34 @@
+# 환경변수 (절대 커밋 금지)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# DB
+*.db
+*.sqlite3
+
+# Node / Frontend
+FrontEnd/node_modules/
+FrontEnd/dist/
+FrontEnd/.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
