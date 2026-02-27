@@ -3,12 +3,10 @@ import email
 import email.utils
 import imaplib
 import quopri
-import re
 from email.header import decode_header
-from html.parser import HTMLParser
 from datetime import datetime, timezone, timedelta
 import os
-
+from html.parser import HTMLParser
 from Backend.database import email_exists, save_email
 
 KST = timezone(timedelta(hours=9))
@@ -22,59 +20,82 @@ DAUM_PASSWORD = os.getenv("DAUM_PASSWORD", "")
 _MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
-# imaputf7 라이브러리 (없으면 fallback 사용)
-try:
-    import imaputf7 as _imaputf7
-    _HAS_IMAPUTF7 = True
-except ImportError:
-    _HAS_IMAPUTF7 = False
-
-
 # ─── 문자열 디코딩 헬퍼 ───────────────────────────────────────────────────────
 
-def _decode_str(value: str | bytes | None, charset: str | None = None) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        for enc in [charset, "utf-8", "euc-kr", "cp949", "latin-1"]:
-            if enc is None:
-                continue
-            try:
-                return value.decode(enc, errors="strict")
-            except Exception:
-                continue
-        return value.decode("latin-1", errors="replace")
-    return value
-
-
 def _decode_header(raw: str) -> str:
-    parts = decode_header(raw or "")
+    if not raw:
+        return ""
+    parts = decode_header(raw)
     decoded = []
     for part, charset in parts:
-        decoded.append(_decode_str(part, charset))
+        if isinstance(part, bytes):
+            if charset:
+                for enc in [charset, 'utf-8', 'euc-kr', 'cp949', 'latin-1']:
+                    try:
+                        decoded.append(part.decode(enc))
+                        break
+                    except Exception:
+                        continue
+                else:
+                    decoded.append(part.decode('latin-1', errors='replace'))
+            else:
+                for enc in ['utf-8', 'euc-kr', 'cp949', 'latin-1']:
+                    try:
+                        decoded.append(part.decode(enc))
+                        break
+                    except Exception:
+                        continue
+        else:
+            decoded.append(part)
     return "".join(decoded)
 
 
-def _decode_folder_bytes(raw: bytes) -> str:
+def _decode_folder_name(raw: bytes | str) -> str:
     """
-    IMAP LIST에서 추출한 폴더명 bytes → 사람이 읽을 수 있는 문자열.
-    1) imaputf7 라이브러리 (modified UTF-7, 가장 정확)
-    2) ASCII decode → utf-7 codec (표준 UTF-7 fallback)
-    3) 원본 latin-1 반환
+    IMAP LIST에서 추출한 폴더명 → 사람이 읽을 수 있는 문자열.
+    Modified UTF-7 (RFC 3501)을 순수 Python으로 디코딩.
+    &...- 형식의 인코딩을 UTF-16-BE base64로 변환.
     """
-    if _HAS_IMAPUTF7:
+    if isinstance(raw, bytes):
         try:
-            return _imaputf7.decode(raw)
+            name = raw.decode('ascii', errors='replace')
         except Exception:
-            pass
+            name = raw.decode('utf-8', errors='replace')
+    else:
+        name = raw
 
-    try:
-        name_str = raw.decode('ascii')
-        return name_str.encode('ascii').decode('utf-7')
-    except Exception:
-        pass
+    # Modified UTF-7 디코딩
+    # IMAP Modified UTF-7: &...-, 표준 UTF-7과 달리 ',' 대신 '/' 사용
+    result = []
+    i = 0
+    while i < len(name):
+        if name[i] == '&':
+            end = name.find('-', i + 1)
+            if end == -1:
+                result.append(name[i])
+                i += 1
+                continue
+            encoded = name[i+1:end]
+            if encoded == '':
+                # &- 는 리터럴 &
+                result.append('&')
+            else:
+                try:
+                    # Modified UTF-7: ',' → '/' 로 치환 후 base64 디코딩
+                    b64 = encoded.replace(',', '/')
+                    # base64 패딩 맞추기
+                    pad = (-len(b64)) % 4
+                    b64 += '=' * pad
+                    decoded_bytes = base64.b64decode(b64)
+                    result.append(decoded_bytes.decode('utf-16-be'))
+                except Exception:
+                    result.append(name[i:end+1])
+            i = end + 1
+        else:
+            result.append(name[i])
+            i += 1
 
-    return raw.decode('latin-1', errors='replace')
+    return ''.join(result)
 
 
 # ─── 날짜/시각 헬퍼 ──────────────────────────────────────────────────────────
@@ -102,65 +123,6 @@ def _since_date_str(days: int = 30) -> str:
 
 # ─── 본문 추출 ────────────────────────────────────────────────────────────────
 
-class _MLStripper(HTMLParser):
-    """HTML 태그를 제거하고 텍스트만 추출."""
-
-    def __init__(self):
-        super().__init__()
-        self._parts: list[str] = []
-        self._skip = False
-
-    def handle_starttag(self, tag, attrs):
-        if tag.lower() in ('style', 'script'):
-            self._skip = True
-
-    def handle_endtag(self, tag):
-        if tag.lower() in ('style', 'script'):
-            self._skip = False
-
-    def handle_data(self, data):
-        if not self._skip:
-            self._parts.append(data)
-
-    def get_text(self) -> str:
-        return re.sub(r'\s+', ' ', ''.join(self._parts)).strip()
-
-
-def _strip_html(html: str) -> str:
-    """HTML → 순수 텍스트. HTMLParser 실패 시 regex fallback."""
-    stripper = _MLStripper()
-    try:
-        stripper.feed(html)
-        return stripper.get_text()
-    except Exception:
-        text = re.sub(r'<[^>]+>', '', html)
-        return re.sub(r'\s+', ' ', text).strip()
-
-
-def _decode_payload(raw_bytes: bytes, cte: str, charset: str | None) -> str:
-    """
-    Content-Transfer-Encoding 명시 처리 후 charset fallback으로 str 반환.
-    cte: 'base64' | 'quoted-printable' | '7bit' | '8bit' | 'binary'
-    """
-    try:
-        if cte == 'base64':
-            raw_bytes = base64.b64decode(raw_bytes)
-        elif cte == 'quoted-printable':
-            raw_bytes = quopri.decodestring(raw_bytes)
-        # 7bit / 8bit / binary → 그대로 사용
-    except Exception:
-        pass  # CTE 디코딩 실패 시 원본 bytes 그대로
-
-    for enc in [charset, 'utf-8', 'euc-kr', 'cp949', 'latin-1']:
-        if not enc:
-            continue
-        try:
-            return raw_bytes.decode(enc, errors='strict')
-        except Exception:
-            continue
-    return raw_bytes.decode('latin-1', errors='replace')
-
-
 def _get_body(msg: email.message.Message) -> str:
     """
     메일 메시지에서 본문 텍스트 추출.
@@ -168,44 +130,59 @@ def _get_body(msg: email.message.Message) -> str:
     - singlepart: content-type에 따라 처리
     CTE를 명시적으로 처리 (base64 / quoted-printable).
     """
-    plain: str | None = None
-    html: str | None = None
 
-    def _extract(part: email.message.Message) -> str:
-        cte = (part.get('Content-Transfer-Encoding') or '').lower().strip()
-        charset = part.get_content_charset()
-        raw_str = part.get_payload(decode=False)
-        if not raw_str or isinstance(raw_str, list):
+
+    class HTMLTextExtractor(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.text = []
+
+        def handle_data(self, data):
+            self.text.append(data)
+
+        def get_text(self):
+            return ' '.join(self.text).strip()
+
+    def decode_payload(part) -> str:
+        # get_payload(decode=True) 가 base64/quoted-printable 을 자동 처리
+        payload = part.get_payload(decode=True)
+        if not payload:
             return ""
-        raw_bytes = raw_str.encode('ascii', errors='replace')
-        return _decode_payload(raw_bytes, cte, charset)
+        charset = part.get_content_charset()
+
+        for enc in [charset, 'utf-8', 'euc-kr', 'cp949', 'latin-1']:
+            if not enc:
+                continue
+            try:
+                return payload.decode(enc)
+            except Exception:
+                continue
+        return payload.decode('latin-1', errors='replace')
+
+    plain_text = ""
+    html_text = ""
 
     if msg.is_multipart():
         for part in msg.walk():
-            ct = part.get_content_type()
-            if ct.startswith('multipart/'):
-                continue
-            cd = str(part.get_content_disposition() or '')
-            if 'attachment' in cd:
-                continue
-
-            if ct == 'text/plain' and plain is None:
-                plain = _extract(part)
-            elif ct == 'text/html' and html is None:
-                html = _extract(part)
+            content_type = part.get_content_type()
+            if content_type == 'text/plain' and not plain_text:
+                plain_text = decode_payload(part)
+            elif content_type == 'text/html' and not html_text:
+                raw_html = decode_payload(part)
+                extractor = HTMLTextExtractor()
+                extractor.feed(raw_html)
+                html_text = extractor.get_text()
     else:
-        ct = msg.get_content_type()
-        text = _extract(msg)
-        if ct == 'text/html':
-            html = text
-        else:
-            plain = text
+        content_type = msg.get_content_type()
+        if content_type == 'text/plain':
+            plain_text = decode_payload(msg)
+        elif content_type == 'text/html':
+            raw_html = decode_payload(msg)
+            extractor = HTMLTextExtractor()
+            extractor.feed(raw_html)
+            html_text = extractor.get_text()
 
-    if plain and plain.strip():
-        return plain.strip()
-    if html and html.strip():
-        return _strip_html(html)
-    return ""
+    return plain_text or html_text or ""
 
 
 # ─── LIST 응답 파싱 ──────────────────────────────────────────────────────────
@@ -213,12 +190,14 @@ def _get_body(msg: email.message.Message) -> str:
 def _parse_folder_name(item: bytes) -> bytes | None:
     """
     IMAP LIST 응답 한 줄에서 폴더명 bytes 추출.
-    split 우선순위: b'"/"' → b' "/" ' → rsplit 마지막 공백
+    split 우선순위: b'"/"' → b' "/" ' → b'/' → rsplit 마지막 공백
     """
     if b'"/"' in item:
         return item.split(b'"/"', 1)[1].strip().strip(b'"')
     if b' "/" ' in item:
         return item.split(b' "/" ', 1)[1].strip().strip(b'"')
+    if b'/' in item:
+        return item.split(b'/', 1)[1].strip().strip(b'"')
     parts = item.rsplit(b' ', 1)
     if len(parts) == 2:
         return parts[1].strip().strip(b'"')
@@ -243,7 +222,7 @@ def _parse_list_response(items: list) -> list[tuple[bytes, str]]:
             print(f"[IMAP][WARN] LIST 파싱 실패: {item!r}")
             continue
 
-        display_name = _decode_folder_bytes(raw_name)
+        display_name = _decode_folder_name(raw_name)
         results.append((raw_name, display_name))
 
     return results
