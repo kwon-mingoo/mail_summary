@@ -18,7 +18,7 @@
 - **메일 요약**: Daum IMAP 메일을 자동 수집하고 Gemini API로 요약
 - **견적 관리**: 과거 입찰 데이터 관리 및 낙찰률 분석
 
-> **현재 개발 중 (WIP)** — 메일 수집/요약 기능 구현 완료, 리팩토링 진행 중
+> **현재 개발 중 (WIP)** — 메일 수집/요약 기능 구현 완료, 미해결 이슈 대응 중
 
 <br>
 
@@ -26,13 +26,17 @@
 
 ### 메일 요약 서비스
 - Daum IMAP 전체 폴더 자동 순회 수집 (APScheduler, 30분 간격)
-- 최근 30일치 메일만 수집하여 성능 최적화
-- **일별 요약**: 선택한 날짜의 전체 수신 메일 AI 요약
-- **퇴근 후 요약**: 오후 6시 ~ 다음날 오전 9시 수신 메일 요약
+- 최근 30일치 메일 수집 (IMAP SINCE 필터)
+- **어제 / 오늘 / 퇴근 후** 버튼으로 구분 요약
+  - 퇴근 후: 오후 6시 ~ 다음날 오전 9시 수신 메일
 - 폴더(회사/거래처)별 필터링
-- 요약 결과 DB 캐싱 (동일 날짜/타입 재요청 시 즉시 반환)
+- 요약 결과 DB 캐싱 + 재생성 시 캐시 삭제 후 재호출
+- Gemini API 응답에서 할 일(Action Item) 자동 추출
+- 할 일 체크리스트 + 항목별 비고 입력
+- 메일 수동 새로고침 버튼 (POST /api/collect)
 - Modified UTF-7 IMAP 폴더명 디코딩 (순수 Python 구현)
-- euc-kr / cp949 / base64 / quoted-printable 인코딩 처리
+- euc-kr / cp949 / quoted-printable 인코딩 처리
+- UID 기반 증분 수집으로 중복 다운로드 방지
 
 ### 견적 프로그램
 - 과거 입찰 데이터(재료비/노무비/경비) 등록 및 관리
@@ -60,14 +64,14 @@
 ```
 nami-business-suite/
 ├── AI/
-│   └── summarizer.py              # Gemini API 요약 로직
+│   └── summarizer.py              # Gemini API 요약 + 할 일 추출
 ├── Backend/
 │   ├── main.py                    # FastAPI 앱 진입점 + APScheduler
 │   ├── database.py                # SQLite 스키마 및 쿼리
 │   └── imap_collector.py          # Daum IMAP 메일 수집
 ├── FrontEnd/
 │   ├── src/
-│   │   ├── App.tsx                # 메인 컴포넌트 (리팩토링 예정)
+│   │   ├── App.tsx                # 레이아웃 + 전역 상태 관리
 │   │   ├── types.ts               # 공통 타입 정의
 │   │   ├── services.ts            # 서비스 라우팅 설정
 │   │   ├── components/
@@ -130,13 +134,9 @@ uvicorn Backend.main:app --host 127.0.0.1 --port 8000 --reload
 cd FrontEnd && npm run dev
 ```
 
-| 서비스 | 주소 |
-|--------|------|
-| Frontend | http://localhost:5173 |
-| Backend API | http://localhost:8000 |
-| API Docs | http://localhost:8000/docs |
+> 서버 시작 시 APScheduler가 함께 실행되며 3분마다 메일을 자동 수집합니다.
 
-> 서버 시작 시 APScheduler가 함께 실행되며 30분마다 메일을 자동 수집합니다.
+> DB 초기화가 필요한 경우: `rm mail_summary.db` 후 서버 재시작
 
 <br>
 
@@ -146,25 +146,41 @@ cd FrontEnd && npm run dev
 |--------|----------|-------------|
 | `GET` | `/api/folders` | 수집된 메일 폴더 목록 반환 |
 | `GET` | `/api/emails` | 날짜 + 폴더 기준 메일 목록 반환 |
+| `GET` | `/api/summary` | 캐시된 요약 조회 |
 | `POST` | `/api/summary` | 메일 요약 생성 또는 캐시 반환 |
+| `DELETE` | `/api/summary` | 요약 캐시 삭제 |
+| `POST` | `/api/collect` | 메일 즉시 수집 요청 |
 
 #### POST `/api/summary`
 
 ```json
 // Request Body
 {
-  "date": "2026-02-26",
+  "date": "2026-03-05",
   "type": "일별",
   "folder": "전체"
 }
 
 // Response
 {
-  "summary": "요약 내용..."
+  "summary": "요약 내용...",
+  "todos": ["견적서 제출", "시정 조치 확인"]
 }
 ```
 
 `type` 가능한 값: `"일별"` | `"퇴근후"`
+
+#### POST `/api/collect`
+
+```json
+// Response
+{
+  "status": "ok",
+  "message": "메일 수집이 완료되었습니다.",
+  "saved": 3,
+  "skipped": 12
+}
+```
 
 <br>
 
@@ -191,21 +207,28 @@ cd FrontEnd && npm run dev
 | folder | TEXT | 폴더명 (`전체` 또는 특정 폴더명) |
 | date | TEXT | 요약 날짜 (YYYY-MM-DD) |
 | type | TEXT | `일별` \| `퇴근후` |
-| content | TEXT | 요약 내용 |
+| content | TEXT | 요약 + 할 일 목록 (JSON) |
 | created_at | TEXT | 생성 시간 |
 
 <br>
 
-## Known Issues & Roadmap
+## Known Issues
 
-### 현재 알려진 이슈
-- [ ] 첨부파일 포함 메일 본문 미수집
+현재 미해결 상태로 추가 대응 필요한 항목들입니다.
 
-### 진행 예정
-- [ ] `App.tsx` 모듈 분리 리팩토링 (`services.ts` 기반 라우팅)
-- [ ] 메일 본문 인코딩 안정성 개선
-- [ ] 사용자 인증
-- [ ] 모바일 반응형 UI
+- [ ] **안 읽은 메일 수집 안 됨**: IMAP UNSEEN 검색 시 Daum 서버에서 정상 반환되지 않는 문제. `mail.uid('search', None, 'UNSEEN')` 으로 별도 수집 시도했으나 미해결
+- [ ] **HTML 형식 메일 본문 깨짐**: HTML 전용 메일에서 태그 제거 후에도 인코딩이 깨지는 경우 존재
+- [ ] **첨부파일 포함 메일 본문 미수집**: multipart/mixed 구조에서 본문이 누락되는 케이스
+- [ ] **메일 새로고침 후 최신 메일 반영 지연**: POST /api/collect 완료 후 DB 반영 타이밍 불일치
+
+<br>
+
+## Roadmap
+
+- [ ] 안 읽은 메일 수집 문제 근본 해결
+- [ ] HTML 메일 본문 파싱 개선
+- [ ] 견적 데이터 백엔드 API 연동
+- [ ] 사용자 인증 (로그인)
 
 <br>
 

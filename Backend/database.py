@@ -93,6 +93,15 @@ def save_summary(date: str, summary_type: str, folder: str, content: str):
         conn.commit()
 
 
+def delete_summary(date: str, summary_type: str, folder: str):
+    with get_conn() as conn:
+        conn.execute(
+            "DELETE FROM summaries WHERE date = ? AND type = ? AND folder = ?",
+            (date, summary_type, folder)
+        )
+        conn.commit()
+
+
 def email_exists(subject: str, sender: str, received_at: str) -> bool:
     with get_conn() as conn:
         row = conn.execute(

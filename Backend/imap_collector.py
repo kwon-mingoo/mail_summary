@@ -16,6 +16,9 @@ IMAP_PORT = 993
 DAUM_EMAIL = os.getenv("DAUM_EMAIL", "")
 DAUM_PASSWORD = os.getenv("DAUM_PASSWORD", "")
 
+# 폴더별 마지막으로 처리한 최대 UID (서버 재시작 시 초기화 → 첫 수집은 전체 30일치)
+_last_uid: dict[str, int] = {}
+
 # 영어 월 약어 (strftime %b 가 로케일에 따라 달라지는 문제 방지)
 _MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -231,90 +234,128 @@ def _parse_list_response(items: list) -> list[tuple[bytes, str]]:
 # ─── 메인 수집 함수 ──────────────────────────────────────────────────────────
 
 def collect_emails():
+    global _last_uid
+
     if not DAUM_EMAIL or not DAUM_PASSWORD:
         print("[IMAP] 환경변수 DAUM_EMAIL / DAUM_PASSWORD 미설정 — 수집 건너뜀")
-        return
+        return {"saved": 0, "skipped": 0}
+
+    start_kst = datetime.now(KST)
+    print(f"[IMAP] {start_kst.strftime('%H:%M:%S')} 수집 시작")
 
     # ── 로그인
     try:
         mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
         mail.login(DAUM_EMAIL, DAUM_PASSWORD)
-        print("[IMAP] 로그인 성공")
     except Exception as e:
         print(f"[IMAP] 로그인 실패: {e}")
-        return
+        return {"saved": 0, "skipped": 0}
 
     since_date = _since_date_str(30)
-    print(f"[IMAP] 수집 기간: {since_date} 이후")
 
     try:
         # ── 폴더 목록
         _, folder_list = mail.list()
         if not folder_list:
             print("[IMAP] 폴더 목록이 비어 있습니다.")
-            return
+            return {"saved": 0, "skipped": 0}
 
         folders = _parse_list_response(folder_list)
         print(f"[IMAP] 전체 폴더 수: {len(folders)}")
-        for _, dname in folders:
-            print(f"[IMAP]   폴더: {dname!r}")
 
-        saved = 0
+        total_saved = 0
+        total_skipped = 0
         for raw_name, display_name in folders:
             try:
-                # ── 폴더 선택 (원본 bytes 그대로 사용)
+                # ── 폴더 선택 (원본 bytes 그대로 사용, readonly=True 로 읽음 상태 변경 없음)
                 select_arg = b'"' + raw_name + b'"'
                 status, select_data = mail.select(select_arg, readonly=True)
                 if status != "OK":
                     print(f"[IMAP] SELECT 실패 ({display_name!r}): status={status}, data={select_data}")
                     continue
 
-                # ── 30일 이내 메일만 검색
-                _, data = mail.search(None, f'SINCE {since_date}')
-                if not data or not data[0]:
-                    print(f"[IMAP] '{display_name}' — 메일 없음")
+                # ── SINCE 조건으로 신규 UID 검색 (조건을 별도 인자로 분리 → IMAP 서버 파싱 안정성)
+                last = _last_uid.get(display_name, 0)
+                if last > 0:
+                    _, data_since = mail.uid('search', None,
+                                            f'SINCE {since_date}',
+                                            f'UID {last + 1}:*')
+                else:
+                    _, data_since = mail.uid('search', None,
+                                            f'SINCE {since_date}')
+
+                uids_since = set(data_since[0].split()) if data_since and data_since[0] else set()
+
+                # ── UNSEEN 메일 별도 검색 (날짜 무관, 안 읽은 메일 누락 방지)
+                _, data_unseen = mail.uid('search', None, 'UNSEEN')
+                uids_unseen = set(data_unseen[0].split()) if data_unseen and data_unseen[0] else set()
+
+                # ── 합산 후 UID 오름차순 정렬
+                uid_list = sorted(
+                    uids_since | uids_unseen,
+                    key=lambda x: int(x.decode('ascii'))
+                )
+
+                if not uid_list:
+                    print(f"[IMAP] '{display_name}' — 신규 없음")
                     continue
 
-                uids = data[0].split()
-                print(f"[IMAP] '{display_name}' — {since_date} 이후 {len(uids)}통")
+                print(f"[IMAP] '{display_name}' — "
+                      f"SINCE {len(uids_since)}건 + UNSEEN {len(uids_unseen)}건 "
+                      f"= 총 {len(uid_list)}건")
+
+                # ── 최대 UID 업데이트는 SINCE 기준으로만 (다음 수집에서 이 UID 이후만 검색)
+                if uids_since:
+                    _last_uid[display_name] = max(int(u.decode('ascii')) for u in uids_since)
 
                 folder_saved = 0
-                for uid in uids:
-                    _, msg_data = mail.fetch(uid, "(RFC822)")
-                    if not msg_data or not msg_data[0]:
-                        print(f"[IMAP]   UID {uid!r}: fetch 결과 없음")
+                folder_skipped = 0
+                for uid in uid_list:
+                    uid_bytes = uid if isinstance(uid, bytes) else str(uid).encode()
+                    # 1단계: 헤더만 fetch → subject/sender/received_at 파싱
+                    _, hdr_data = mail.uid('fetch', uid_bytes, '(RFC822.HEADER)')
+                    if not hdr_data or not hdr_data[0]:
+                        continue
+                    raw_hdr = hdr_data[0][1] if isinstance(hdr_data[0], tuple) else hdr_data[0]
+                    if not raw_hdr:
                         continue
 
-                    raw = msg_data[0][1] if isinstance(msg_data[0], tuple) else msg_data[0]
-                    if not raw:
-                        print(f"[IMAP]   UID {uid!r}: raw 데이터 없음")
-                        continue
-
-                    msg = email.message_from_bytes(raw)
-
-                    subject = _decode_header(msg.get("Subject", "(제목없음)"))
-                    sender = _decode_header(msg.get("From", "(발신자없음)"))
-                    dt = _parse_received_at(msg)
+                    hdr_msg = email.message_from_bytes(raw_hdr)
+                    subject = _decode_header(hdr_msg.get("Subject", "(제목없음)"))
+                    sender = _decode_header(hdr_msg.get("From", "(발신자없음)"))
+                    dt = _parse_received_at(hdr_msg)
                     received_at = dt.strftime("%Y-%m-%dT%H:%M:%S")
                     after_hours = _is_after_hours(dt)
 
+                    # 2단계: 중복 확인 — 중복이면 전문 다운로드 생략
                     if email_exists(subject, sender, received_at):
-                        continue  # 중복 건너뜀
+                        folder_skipped += 1
+                        continue
 
-                    body = _get_body(msg)[:10_000]  # DB 저장 크기 제한
+                    # 3단계: 새 메일만 RFC822 전문 fetch → 본문 추출
+                    _, msg_data = mail.uid('fetch', uid_bytes, '(RFC822)')
+                    if not msg_data or not msg_data[0]:
+                        continue
+                    raw = msg_data[0][1] if isinstance(msg_data[0], tuple) else msg_data[0]
+                    if not raw:
+                        continue
 
-                    print(f"[IMAP]   저장: [{display_name}] {sender!r} | {subject!r} | {received_at}")
+                    body = _get_body(email.message_from_bytes(raw))[:10_000]
+
                     save_email(display_name, subject, sender, received_at, after_hours, body)
                     folder_saved += 1
-                    saved += 1
+                    total_saved += 1
 
-                print(f"[IMAP] '{display_name}' — 신규 저장 {folder_saved}건")
+                print(f"[IMAP] '{display_name}' — 신규 {folder_saved}건 / 중복 {folder_skipped}건 스킵")
+                total_skipped += folder_skipped
 
             except Exception as e:
                 print(f"[IMAP] 폴더 '{display_name}' 처리 오류: {type(e).__name__}: {e}")
                 continue
 
-        print(f"[IMAP] 수집 완료 — 신규 {saved}건 저장")
+        end_kst = datetime.now(KST)
+        print(f"[IMAP] {end_kst.strftime('%H:%M:%S')} 수집 완료 — 총 신규 {total_saved}건")
+        return {"saved": total_saved, "skipped": total_skipped}
 
     finally:
         try:
